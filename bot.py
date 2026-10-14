@@ -1,160 +1,180 @@
 import asyncio
 import logging
-import socket
+import os
+import urllib.parse
 import aiohttp
+from aiohttp import web
 import aiosqlite
-from aiogram import Bot, Dispatcher, F
-from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.filters import CommandStart
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.filters import Command
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, LabeledPrice, PreCheckoutQuery
 
-# Твой токен от Telegram:
-TOKEN = "8844480231:AAHS9zOShX1I9tJQ8WFIA1wfVPC15bKLYD0"
-
-class IPv4Session(AiohttpSession):
-    def __init__(self):
-        super().__init__(timeout=120)
-        self._connector_init["family"] = socket.AF_INET
-
-bot = Bot(token=TOKEN, session=IPv4Session())
-dp = Dispatcher()
+# --- НАСТРОЙКИ БОТА ---
+TOKEN = "8844480231:AAF8L_uM1R9C1W5R3_xG-zI4U8pY2wK6vQo"  # Проверь свой токен!
+ADMIN_ID = 944857374
 DB_NAME = "users.db"
+SUBSCRIPTION_PRICE_STARS = 150  # Цена PRO-доступа в Telegram Stars (экв. ~290-300 ₽)
 
+logging.basicConfig(level=logging.INFO)
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
+
+# --- БАЗА ДАННЫХ ---
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, username TEXT, free_limits INTEGER DEFAULT 3, is_vip INTEGER DEFAULT 0)")
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                free_left INTEGER DEFAULT 3,
+                is_pro INTEGER DEFAULT 0
+            )
+        """)
         await db.commit()
 
-async def get_or_create_user(user_id: int, username: str):
+async def get_user(user_id: int):
     async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute("SELECT free_limits, is_vip FROM users WHERE user_id = ?", (user_id,))
-        row = await cursor.fetchone()
-        if row is None:
-            await db.execute("INSERT INTO users (user_id, username, free_limits, is_vip) VALUES (?, ?, 3, 0)", (user_id, username))
-            await db.commit()
-            return 3, 0
-        return row[0], row[1]
+        async with db.execute("SELECT free_left, is_pro FROM users WHERE user_id = ?", (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                await db.execute("INSERT INTO users (user_id, free_left, is_pro) VALUES (?, 3, 0)", (user_id,))
+                await db.commit()
+                return 3, 0
+            return row[0], row[1]
 
-async def spend_limit(user_id: int):
+async def use_attempt(user_id: int):
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE users SET free_limits = free_limits - 1 WHERE user_id = ?", (user_id,))
+        await db.execute("UPDATE users SET free_left = free_left - 1 WHERE user_id = ? AND is_pro = 0", (user_id,))
         await db.commit()
 
-# Бесплатный ИИ-шлюз, который работает из РФ напрямую без VPN и без ключей
-async def generate_ai_seo(product_text: str) -> str:
-    prompt = (
+async def set_pro(user_id: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("UPDATE users SET is_pro = 1 WHERE user_id = ?", (user_id,))
+        await db.commit()
+
+# --- ИИ ГЕНЕРАТОР SEO (Бесплатный шлюз Pollinations AI) ---
+async def generate_seo(product_text: str) -> str:
+    system_prompt = (
         "Ты профессиональный SEO-копирайтер для маркетплейсов Wildberries и Ozon. "
-        "Пользователь пришлет название товара и его краткие характеристики. "
-        "Составь готовую карточку товара строго по структуре:\n"
-        "1. 📌  Продающий SEO-заголовок (до 60 символов)\n"
-        "2. 📝  Описание (2-3 абзаца, без воды, с ключевыми запросами покупателей)\n"
-        "3. 🔥  5 главных преимуществ (списком с буллитами)\n"
-        "4. 📋 Характеристики для заполнения карточки\n"
-        "5. 🔑  10 высокочастотных SEO-ключей через запятую.\n"
-        "Пиши живо, грамотно, на русском языке."
+        "Напиши продающее SEO-описание карточки товара на русском языке. "
+        "Структура ответа:\n"
+        "1. Продающий заголовок (до 60 символов)\n"
+        "2. Описание товара (1000-1500 символов с ключевыми словами)\n"
+        "3. 5 главных преимуществ (буллитами)\n"
+        "4. Блок из 10-15 ключевых запросов через запятую.\n"
+        "Пиши живо, без воды и без символов разметки Markdown вроде ** или ##."
     )
+    url = "https://text.pollinations.ai/"
     payload = {
-        "model": "openai",
         "messages": [
-            {"role": "system", "content": prompt},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": f"Товар: {product_text}"}
         ],
-        "temperature": 0.7
+        "model": "openai"
     }
-    headers = {"Content-Type": "application/json"}
-    connector = aiohttp.TCPConnector(family=socket.AF_INET)
-    
-    async with aiohttp.ClientSession(connector=connector) as session:
-        async with session.post("https://text.pollinations.ai/openai", headers=headers, json=payload, timeout=60) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                return data["choices"][0]["message"]["content"]
-            else:
-                raise Exception(f"Код {resp.status}: {await resp.text()}")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, timeout=60) as resp:
+                if resp.status == 200:
+                    text = await resp.text()
+                    return text.replace("**", "").replace("##", "").replace("###", "")
+                else:
+                    # Резервный GET-запрос, если POST перегружен
+                    encoded = urllib.parse.quote(f"{system_prompt}\nТовар: {product_text}")
+                    async with session.get(f"https://text.pollinations.ai/{encoded}", timeout=60) as resp2:
+                        return (await resp2.text()).replace("**", "").replace("##", "")
+    except Exception as e:
+        return f"⚠️  Сервер ИИ временно перегружен, попробуй еще раз через пару секунд! ({e})"
 
-main_kb = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="🚀  Сгенерировать описание"), KeyboardButton(text="👤  Мой профиль / Подписка")],
-        [KeyboardButton(text="⚙️  Статус системы")]
-    ],
-    resize_keyboard=True
-)
+# --- КЛАВИАТУРЫ ---
+def get_buy_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"💎  Купить PRO-безлимит ({SUBSCRIPTION_PRICE_STARS} ⭐)", callback_data="buy_stars")]
+    ])
 
-buy_kb = InlineKeyboardMarkup(
-    inline_keyboard=[
-        [InlineKeyboardButton(text="💎  Купить PRO-безлимит (290 ₽/мес)", callback_data="buy_pro")],
-        [InlineKeyboardButton(text="🎁  Протестировать выдачу VIP (Для админа)", callback_data="test_vip")]
-    ]
-)
-
-@dp.message(CommandStart())
-async def cmd_start(message: Message):
-    limits, is_vip = await get_or_create_user(message.from_user.id, message.from_user.username or "NoName")
-    status = "💎  PRO Безлимит" if is_vip else f"🎁  Тестовый ({limits} беспл. генераций)"
-    await message.answer(f"Привет, {message.from_user.first_name}! 👋 \n"
-        f"Я ИИ-Помощник селлера для WB и Ozon.\n\n"
-        f"Твой тариф: {status}\n\n"
-        f"Напиши мне любой товар, и нейросеть за пару секунд соберет готовую SEO-карточку!",
-        reply_markup=main_kb
+# --- ОБРАБОТЧИКИ КОМАНД ---
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    free_left, is_pro = await get_user(message.from_user.id)
+    status = "💎  PRO Безлимит" if is_pro else f"🎁  Бесплатных генераций: {free_left}"
+    await message.answer(
+        f"👋  Привет! Я ИИ-помощник для селлеров **Wildberries и Ozon**.\n\n"
+        f"Напиши мне название товара и его краткие характеристики (например: *Платье женское летнее хлопок, размеры 42-48*), "
+        f"и я за 10 секунд соберу готовую продающую SEO-карточку!\n\n"
+        f"Твой статус: {status}",
+        reply_markup=None if is_pro else get_buy_kb()
     )
 
-@dp.message(F.text == "👤  Мой профиль / Подписка")
-async def check_sub(message: Message):
-    limits, is_vip = await get_or_create_user(message.from_user.id, message.from_user.username or "NoName")
-    if is_vip:
-        text = f"👤  Ваш ID: {message.from_user.id}\n💎  Тариф: PRO Безлимит активен!"
-    else:
-        text = f"👤  Ваш ID: {message.from_user.id}\n🔋  Осталось бесплатных генераций: {limits} шт.\n\nОформите подписку, чтобы снять лимиты:"
-    await message.answer(text, reply_markup=buy_kb)
-
-@dp.message(F.text == "⚙️  Статус системы")
-async def sys_status(message: Message):
-    await message.answer("✅ База данных подключена.\n🧠  Модуль ИИ (GPT-4o-mini) активен и работает без региональных блокировок.")
-
-@dp.message(F.text == "🚀  Сгенерировать описание")
-async def start_gen(message: Message):
-    await message.answer("✍️  Напиши в чат название товара и 2-3 его характеристики:")
-
-@dp.callback_query(F.data == "buy_pro")
-async def process_buy(call: CallbackQuery):
-    await call.message.answer("💳 Оплата подписки PRO (290 ₽)\n\nНажми кнопку «Протестировать выдачу VIP» выше для проверки безлимита.")
-    await call.answer()
-
-@dp.callback_query(F.data == "test_vip")
-async def give_test_vip(call: CallbackQuery):
+@dp.message(Command("admin"))
+async def cmd_admin(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE users SET is_vip = 1 WHERE user_id = ?", (call.from_user.id,))
-        await db.commit()
-    await call.message.answer("🎉  Поздравляем! Тебе включен безлимитный VIP-доступ!")
-    await call.answer()
+        async with db.execute("SELECT COUNT(*), SUM(is_pro) FROM users") as cur:
+            total, pros = await cur.fetchone()
+    await message.answer(f"📊  **Админ-панель**\nВсего пользователей: {total}\nPRO-подписок: {pros or 0}")
 
+# --- ОПЛАТА TELEGRAM STARS ---
+@dp.callback_query(F.data == "buy_stars")
+async def process_buy_stars(callback: types.CallbackQuery):
+    await callback.message.answer_invoice(
+        title="💎  PRO-безлимит на генерацию SEO",
+        description="Полный безлимит на создание продающих SEO-описаний для Wildberries и Ozon.",
+        payload="pro_sub_stars",
+        provider_token="",  # Для Telegram Stars (XTR) всегда пустая строка
+        currency="XTR",
+        prices=[LabeledPrice(label="PRO Безлимит", amount=SUBSCRIPTION_PRICE_STARS)]
+    )
+    await callback.answer()
+
+@dp.pre_checkout_query()
+async def on_pre_checkout(pre_checkout_query: PreCheckoutQuery):
+    await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
+
+@dp.message(F.successful_payment)
+async def on_successful_payment(message: types.Message):
+    await set_pro(message.from_user.id)
+    await message.answer("🎉  **Оплата прошла успешно!**\nТебе активирован 💎  **PRO-безлимит**! Отправляй названия товаров без ограничений.")
+
+# --- ГЕНЕРАЦИЯ ПО ТЕКСТУ ---
 @dp.message(F.text)
-async def generate_card(message: Message):
-    limits, is_vip = await get_or_create_user(message.from_user.id, message.from_user.username or "NoName")
-    if not is_vip and limits <= 0:
+async def handle_text(message: types.Message):
+    user_id = message.from_user.id
+    free_left, is_pro = await get_user(user_id)
+
+    if not is_pro and free_left <= 0:
         await message.answer(
-            "⛔ У вас закончились бесплатные генерации (0 из 3)!\n\nАктивируйте подписку PRO:",
-            reply_markup=buy_kb
+            f"🔒 Бесплатные генерации закончились!\n\n"
+            f"Подключи **PRO-безлимит** всего за **{SUBSCRIPTION_PRICE_STARS} ⭐** и создавай описания без ограничений:",
+            reply_markup=get_buy_kb()
         )
         return
 
-    wait_msg = await message.answer("⏳ Нейросеть анализирует ключи и пишет SEO-описание...")
+    wait_msg = await message.answer("⏳ Генерирую продающее SEO-описание для WB и Ozon... Подожди 10–15 секунд.")
+    seo_result = await generate_seo(message.text)
 
-    try:
-        ai_result = await generate_ai_seo(message.text)
-        if not is_vip:
-            await spend_limit(message.from_user.id)
-            limits -= 1
-        
-        footer = f"\n─────────────────\n🔋  Остаток генераций: {'Безлимит 💎 ' if is_vip else f'{limits} шт.'}"
-        await wait_msg.edit_text(ai_result + footer)
-    except Exception as e:
-        await wait_msg.edit_text(f"⚠️  Ответ сервера ИИ: {e}")
+    if not is_pro:
+        await use_attempt(user_id)
+
+    await wait_msg.edit_text(seo_result)
+
+# --- ВЕБ-ЗАГЛУШКА ДЛЯ БЕСПЛАТНОГО ХОСТИНГА (KOYEB / RENDER) ---
+async def health_check(request):
+    return web.Response(text="WB SEO Bot is running 24/7!")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logging.info(f"Web server started on port {port}")
 
 async def main():
-    logging.basicConfig(level=logging.INFO)
     await init_db()
-    print("ИИ-Бот (открытый шлюз РФ) успешно запущен!")
+    await start_web_server()
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
