@@ -20,7 +20,6 @@ CLOUDFLARE_ACCOUNT_ID = os.environ["CLOUDFLARE_ACCOUNT_ID"]
 CLOUDFLARE_API_TOKEN = os.environ["CLOUDFLARE_API_TOKEN"]
 DB_NAME = os.environ.get("DB_NAME", "users.db")
 
-# Цепочка моделей Gemini: сначала быстрая, потом стабильная, потом резерв
 GEMINI_MODELS = [
     "gemini-3.8-flash",
     "gemini-flash-latest",
@@ -29,8 +28,13 @@ GEMINI_MODELS = [
 ]
 GEMINI_URL_TEMPLATE = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
-CF_MODEL = "@cf/black-forest-labs/flux-2-dev"
-CF_API_URL = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/{CF_MODEL}"
+# Cloudflare vision для fallback
+CF_VISION_MODEL = "@cf/meta/llama-3.2-11b-vision-instruct"
+CF_VISION_URL = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/{CF_VISION_MODEL}"
+
+# Cloudflare img2img для обложек
+CF_IMG_MODEL = "@cf/black-forest-labs/flux-2-dev"
+CF_IMG_URL = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/{CF_IMG_MODEL}"
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -49,6 +53,22 @@ main_keyboard = ReplyKeyboardMarkup(
         [KeyboardButton(text=BTN_STATUS)]
     ],
     resize_keyboard=True
+)
+
+# --- Промпт для vision (общий) ---
+VISION_PROMPT = (
+    "Ты эксперт по маркетплейсам Wildberries и Ozon. "
+    "Посмотри ВНИМАТЕЛЬНО на фото и определи, что за товар на нём изображён "
+    "(тип товара, цвет, материал, ключевые детали). Отвечай СТРОГО в двух частях, "
+    "разделённых меткой ===SPLIT===:\n\n"
+    "Часть 1 (на русском): Продающее SEO-описание карточки для ЭТОГО товара "
+    "(Заголовок до 60 символов, Описание 800-1200 символов, 5 преимуществ буллитами, "
+    "10-15 ключевых запросов через запятую). Без символов ** и ##.\n\n"
+    "===SPLIT===\n\n"
+    "Часть 2 (СТРОГО НА АНГЛИЙСКОМ, до 30 слов): Instruction for image editing. "
+    "Формат: 'Place this exact product on a clean studio background with soft lighting, "
+    "preserve the product shape, color and details, professional e-commerce photo, 8k'. "
+    "НЕ описывай сам товар — только инструкцию по стилизации."
 )
 
 # --- БД ---
@@ -73,7 +93,7 @@ async def get_user(user_id: int):
                 return 999999, 1
             return row[0], row[1]
 
-# --- SEO ПО ТЕКСТУ (Pollinations) ---
+# --- SEO по тексту (Pollinations) ---
 async def generate_seo(product_text: str) -> str:
     system_prompt = (
         "Ты профессиональный SEO-копирайтер для маркетплейсов Wildberries и Ozon. "
@@ -83,7 +103,7 @@ async def generate_seo(product_text: str) -> str:
         "2. Описание товара (1000-1500 символов с ключевыми словами)\n"
         "3. 5 главных преимуществ (буллитами)\n"
         "4. Блок из 10-15 ключевых запросов через запятую.\n"
-        "Пиши живо, без воды и без символов разметки Markdown вроде ** или ##."
+        "Пиши живо, без воды и без символов ** и ##."
     )
     payload = {
         "messages": [
@@ -105,153 +125,158 @@ async def generate_seo(product_text: str) -> str:
                         text = await resp.text()
                         if len(text.strip()) > 10:
                             return text.replace("**", "").replace("##", "").replace("###", "").strip()
-                    log.warning("SEO HTTP %s", resp.status)
             except Exception as e:
                 log.warning("SEO attempt %d error: %s", attempt + 1, e)
             await asyncio.sleep(1.5)
 
         try:
-            short = (
-                f"Напиши продающее SEO-описание для Wildberries и Ozon "
-                f"(заголовок, описание, 5 преимуществ, ключевые слова) для товара: {product_text}"
-            )
+            short = f"Напиши продающее SEO-описание для Wildberries и Ozon для товара: {product_text}"
             url = "https://text.pollinations.ai/" + urllib.parse.quote(short) + "?model=openai"
             async with s.get(url, timeout=aiohttp.ClientTimeout(total=40)) as resp:
                 if resp.status == 200:
-                    text = await resp.text()
-                    return text.replace("**", "").replace("##", "").replace("###", "").strip()
+                    return (await resp.text()).replace("**", "").replace("##", "").replace("###", "").strip()
         except Exception as e:
-            log.error("SEO GET fallback error: %s", e)
+            log.error("SEO GET error: %s", e)
 
     return "⚠️ Сервер ИИ временно перегружен. Попробуй ещё раз через 10 секунд."
 
-# --- VISION через GEMINI: ФОТО → SEO + ПРОМПТ ДЛЯ ОБЛОЖКИ ---
-async def analyze_photo_and_make_seo(image_bytes: bytes, caption: str = "") -> tuple[str, str]:
-    b64_image = base64.b64encode(image_bytes).decode("utf-8")
-    user_hint = f"Товар на фото: {caption}." if caption else ""
+# --- Парсер ответа "SEO + SPLIT + промпт" ---
+def parse_vision_response(full_text: str) -> tuple[str, str]:
+    full_text = full_text.replace("**", "").replace("##", "").replace("###", "").strip()
+    if "===SPLIT===" in full_text:
+        parts = full_text.split("===SPLIT===")
+        return parts[0].strip(), parts[1].strip()
+    return full_text, "Place this exact product on a clean studio background, soft lighting, 8k"
 
-    prompt = (
-        "Ты эксперт по маркетплейсам Wildberries и Ozon. "
-        "Посмотри ВНИМАТЕЛЬНО на фото и определи, что за товар на нём изображён "
-        "(тип товара, цвет, материал, ключевые детали). Отвечай СТРОГО в двух частях, "
-        "разделённых меткой ===SPLIT===:\n\n"
-        "Часть 1 (на русском): Продающее SEO-описание карточки для ЭТОГО товара "
-        "(Заголовок до 60 символов, Описание 800-1200 символов, 5 преимуществ буллитами, "
-        "10-15 ключевых запросов через запятую). Без символов ** и ##.\n\n"
-        "===SPLIT===\n\n"
-        "Часть 2 (СТРОГО НА АНГЛИЙСКОМ, до 30 слов): Instruction for image editing. "
-        "Формат: 'Place this exact product on a clean studio background with soft lighting, "
-        "preserve the product shape, color and details, professional e-commerce photo, 8k'. "
-        "НЕ описывай сам товар — только инструкцию по стилизации фона и освещения.\n\n"
-        f"{user_hint}"
-    )
+# --- VISION #1: GEMINI (цепочка моделей) ---
+async def analyze_with_gemini(image_bytes: bytes, caption: str = "") -> tuple[str, str] | None:
+    b64_image = base64.b64encode(image_bytes).decode("utf-8")
+    user_hint = f"\n\nПодсказка от пользователя: {caption}" if caption else ""
+    full_prompt = VISION_PROMPT + user_hint
 
     payload = {
         "contents": [{
             "parts": [
-                {"text": prompt},
+                {"text": full_prompt},
                 {"inline_data": {"mime_type": "image/jpeg", "data": b64_image}}
             ]
         }],
-        "generationConfig": {
-            "temperature": 0.7,
-            "maxOutputTokens": 3000
-        }
+        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 3000}
     }
 
     async with aiohttp.ClientSession() as s:
-        # Перебираем модели одну за другой
         for model in GEMINI_MODELS:
             url = GEMINI_URL_TEMPLATE.format(model=model)
-            for attempt in range(3):
-                try:
-                    async with s.post(
-                        url,
-                        headers={"x-goog-api-key": GEMINI_API_KEY},
-                        json=payload,
-                        timeout=aiohttp.ClientTimeout(total=60)
-                    ) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            try:
-                                full_text = data["candidates"][0]["content"]["parts"][0]["text"]
-                            except (KeyError, IndexError) as e:
-                                log.error("Gemini parse error: %s | data=%s", e, str(data)[:300])
-                                await asyncio.sleep(2)
-                                continue
+            try:
+                async with s.post(
+                    url,
+                    headers={"x-goog-api-key": GEMINI_API_KEY},
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=60)
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        try:
+                            full_text = data["candidates"][0]["content"]["parts"][0]["text"]
+                        except (KeyError, IndexError):
+                            continue
+                        log.info("Gemini OK: %s", model)
+                        return parse_vision_response(full_text)
+                    elif resp.status in (503, 429, 404):
+                        log.warning("Gemini %s -> %s, next model", model, resp.status)
+                        continue
+                    else:
+                        err = await resp.text()
+                        log.warning("Gemini %s HTTP %s: %s", model, resp.status, err[:200])
+            except Exception as e:
+                log.warning("Gemini %s error: %s", model, e)
+    return None
 
-                            full_text = full_text.replace("**", "").replace("##", "").replace("###", "")
-                            log.info("Gemini OK with model %s", model)
+# --- VISION #2: CLOUDFLARE (Llama 3.2 11B Vision) ---
+async def analyze_with_cloudflare(image_bytes: bytes, caption: str = "") -> tuple[str, str] | None:
+    b64_image = base64.b64encode(image_bytes).decode("utf-8")
+    user_hint = f"\n\nПодсказка: {caption}" if caption else ""
+    full_prompt = VISION_PROMPT + user_hint
 
-                            if "===SPLIT===" in full_text:
-                                parts = full_text.split("===SPLIT===")
-                                return parts[0].strip(), parts[1].strip()
-                            return full_text.strip(), (
-                                "Place this exact product on a clean studio background, "
-                                "soft lighting, preserve product details, 8k"
-                            )
-                        elif resp.status in (503, 429):
-                            # Модель перегружена — переходим к следующей модели
-                            err = await resp.text()
-                            log.warning("Gemini %s -> %s (switching model): %s", model, resp.status, err[:150])
-                            break
-                        elif resp.status == 404:
-                            # Модель не существует — переходим к следующей
-                            log.warning("Gemini model %s not found (404), trying next", model)
-                            break
-                        else:
-                            err = await resp.text()
-                            log.warning("Gemini %s HTTP %s: %s", model, resp.status, err[:300])
-                except Exception as e:
-                    log.warning("Gemini %s attempt %d error: %s", model, attempt + 1, e)
-                await asyncio.sleep(2)
-            # Небольшая пауза перед следующей моделью
-            await asyncio.sleep(1)
+    # Llama 3.2 Vision на Cloudflare принимает image как массив base64-строк
+    payload = {
+        "prompt": full_prompt,
+        "image": [b64_image],
+        "max_tokens": 3000
+    }
 
-    # Все модели упали — фоллбэк
-    log.error("All Gemini models failed, fallback to Pollinations")
-    fallback_topic = caption if caption else "кроссовки спортивные мужские"
-    seo_fallback = await generate_seo(
-        f"{fallback_topic}. Сделай полноценное продающее SEO-описание для маркетплейса Wildberries."
+    async with aiohttp.ClientSession() as s:
+        try:
+            async with s.post(
+                CF_VISION_URL,
+                headers={"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"},
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=90)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    text = data.get("result", {}).get("response", "")
+                    if text:
+                        log.info("Cloudflare Vision OK")
+                        return parse_vision_response(text)
+                else:
+                    err = await resp.text()
+                    log.warning("Cloudflare Vision HTTP %s: %s", resp.status, err[:300])
+        except Exception as e:
+            log.warning("Cloudflare Vision error: %s", e)
+    return None
+
+# --- VISION: объединяем с приоритетами ---
+async def analyze_photo_and_make_seo(image_bytes: bytes, caption: str = "") -> tuple[str, str]:
+    # 1. Пробуем Gemini
+    result = await analyze_with_gemini(image_bytes, caption)
+    if result:
+        return result
+
+    log.warning("Gemini failed, trying Cloudflare Vision")
+    # 2. Пробуем Cloudflare
+    result = await analyze_with_cloudflare(image_bytes, caption)
+    if result:
+        return result
+
+    # 3. Оба упали — честное сообщение
+    log.error("All vision providers failed")
+    return (
+        "⚠️ Не удалось распознать товар на фото — сервисы ИИ временно перегружены. "
+        "Попробуйте ещё раз через 1-2 минуты или добавьте короткую подпись к фото "
+        "(например: «Часы наручные мужские»).",
+        "Place this exact product on a clean studio background, soft lighting, 8k"
     )
-    return seo_fallback, "Place this exact product on a clean studio background, soft lighting, 8k"
 
-# --- ГЕНЕРАЦИЯ ОБЛОЖКИ через CLOUDFLARE WORKERS AI (img2img) ---
+# --- ГЕНЕРАЦИЯ ОБЛОЖКИ (Cloudflare img2img) ---
 async def generate_card_image(prompt: str, image_bytes: bytes | None = None) -> bytes | None:
     headers = {"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"}
-
     form = aiohttp.FormData()
     form.add_field("prompt", prompt)
 
     if image_bytes:
-        form.add_field(
-            "input_image_0",
-            image_bytes,
-            filename="input.jpg",
-            content_type="image/jpeg"
-        )
+        form.add_field("input_image_0", image_bytes, filename="input.jpg", content_type="image/jpeg")
 
     async with aiohttp.ClientSession() as s:
         for attempt in range(3):
             try:
                 async with s.post(
-                    CF_API_URL,
+                    CF_IMG_URL,
                     headers=headers,
                     data=form,
                     timeout=aiohttp.ClientTimeout(total=120)
                 ) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        result = data.get("result", {})
-                        img_b64 = result.get("image")
+                        img_b64 = data.get("result", {}).get("image")
                         if img_b64:
                             return base64.b64decode(img_b64)
-                        log.warning("Cloudflare: no image in response: %s", str(data)[:300])
+                        log.warning("CF img: no image: %s", str(data)[:200])
                     else:
                         err = await resp.text()
-                        log.warning("Cloudflare HTTP %s attempt %d: %s", resp.status, attempt + 1, err[:300])
+                        log.warning("CF img HTTP %s attempt %d: %s", resp.status, attempt + 1, err[:200])
             except Exception as e:
-                log.warning("Cloudflare attempt %d error: %s", attempt + 1, e)
+                log.warning("CF img attempt %d error: %s", attempt + 1, e)
             await asyncio.sleep(3 * (attempt + 1))
     return None
 
@@ -262,11 +287,10 @@ async def cmd_start(message: types.Message):
     await message.answer(
         "👋 Привет! Я ИИ-помощник для селлеров Wildberries и Ozon.\n\n"
         "📌 Что я умею:\n"
-        "1️⃣ Отправь мне текстом название товара — я соберу SEO-описание.\n"
-        "2️⃣ Отправь мне фотографию товара (лучше с короткой подписью) — "
-        "я проанализирую фото, сделаю студийную обложку 3:4 "
-        "с сохранением дизайна товара и напишу полное SEO-описание.\n\n"
-        "✨ У тебя активен полный безлимит на все генерации.",
+        "1️⃣ Отправь текстом название товара — соберу SEO-описание.\n"
+        "2️⃣ Отправь фото товара (можно с подписью) — сделаю студийную обложку 3:4 "
+        "с сохранением дизайна и напишу SEO-описание.\n\n"
+        "✨ У тебя активен полный безлимит.",
         reply_markup=main_keyboard
     )
 
@@ -277,7 +301,7 @@ async def cmd_admin(message: types.Message):
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT COUNT(*) FROM users") as cur:
             (total,) = await cur.fetchone()
-    await message.answer(f"📊 Админ-панель\n\nВсего пользователей: {total}\nРежим: Безлимит для всех")
+    await message.answer(f"📊 Админ-панель\n\nВсего пользователей: {total}")
 
 # --- ФОТО ---
 @dp.message(F.photo)
@@ -306,7 +330,7 @@ async def handle_photo(message: types.Message):
             photo_file = BufferedInputFile(generated_img_bytes, filename="wb_ozon_card.jpg")
             await message.answer_photo(
                 photo=photo_file,
-                caption="🎨 Готовая студийная обложка для карточки товара (формат 3:4)!"
+                caption="🎨 Готовая студийная обложка для карточки товара (3:4)!"
             )
             await wait_msg.delete()
             await message.answer(seo_text, reply_markup=main_keyboard)
@@ -316,7 +340,7 @@ async def handle_photo(message: types.Message):
             )
     except Exception as e:
         log.exception("handle_photo error")
-        await wait_msg.edit_text(f"⚠️ Произошла ошибка при обработке фото: {e}")
+        await wait_msg.edit_text(f"⚠️ Ошибка при обработке фото: {e}")
 
 # --- ТЕКСТ И КНОПКИ ---
 @dp.message(F.text)
@@ -328,10 +352,10 @@ async def handle_all_text(message: types.Message):
         await get_user(user_id)
         await message.answer(
             f"📊 Статус системы\n\n"
-            f"🆔 Ваш ID: {user_id}\n"
+            f"🆔 ID: {user_id}\n"
             f"✨ Статус: 💎 PRO Безлимит\n"
-            f"🖼 Генерация по фото: Активна (Gemini Vision + Cloudflare Workers AI)\n"
-            f"🚀 Все системы работают в штатном режиме.",
+            f"🖼 Генерация по фото: Активна\n"
+            f"🚀 Все системы в норме.",
             reply_markup=main_keyboard
         )
         return
@@ -339,20 +363,17 @@ async def handle_all_text(message: types.Message):
     if text == BTN_PROFILE or "Мой профиль" in text:
         await get_user(user_id)
         await message.answer(
-            f"👤 Ваш профиль\n\n"
-            f"• Telegram ID: {user_id}\n"
-            f"• Текущий тариф: 💎 PRO Безлимит (Активен)\n"
-            f"• Доступно: Текстовое SEO + Генерация карточек по фото (∞).",
+            f"👤 Профиль\n\n"
+            f"• ID: {user_id}\n"
+            f"• Тариф: 💎 PRO Безлимит\n"
+            f"• Доступно: SEO + Генерация обложек (∞).",
             reply_markup=main_keyboard
         )
         return
 
     if text == BTN_GEN or "Сгенерировать описание" in text:
         await message.answer(
-            "✍️ Отправь мне:\n"
-            "• Текст (название и характеристики товара)\n"
-            "• Или Фотографию товара (можно с подписью)\n\n"
-            "И я подготовлю SEO-описание и обложку для карточки!",
+            "✍️ Отправь текст или фото товара — подготовлю SEO-описание и обложку.",
             reply_markup=main_keyboard
         )
         return
@@ -362,7 +383,7 @@ async def handle_all_text(message: types.Message):
         return
 
     await get_user(user_id)
-    wait_msg = await message.answer("⏳ Генерирую продающее SEO-описание для WB и Ozon...")
+    wait_msg = await message.answer("⏳ Генерирую SEO-описание...")
     seo_result = await generate_seo(text)
 
     if len(seo_result) <= 4000:
