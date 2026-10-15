@@ -3,7 +3,6 @@ import base64
 import io
 import logging
 import os
-import random
 import urllib.parse
 import aiohttp
 import aiosqlite
@@ -17,9 +16,11 @@ from aiogram.client.session.aiohttp import AiohttpSession
 TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+AGNES_API_KEY = os.environ["AGNES_API_KEY"]
 DB_NAME = os.environ.get("DB_NAME", "users.db")
 
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+AGNES_IMG_URL = "https://apihub.agnes-ai.com/v1/images/generations"
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -128,10 +129,10 @@ async def analyze_photo_and_make_seo(image_bytes: bytes, caption: str = "") -> t
         "(Заголовок до 60 символов, Описание 800-1200 символов, 5 преимуществ буллитами, "
         "10-15 ключевых запросов через запятую). Без символов ** и ##.\n\n"
         "===SPLIT===\n\n"
-        "Часть 2 (СТРОГО НА АНГЛИЙСКОМ, до 30 слов): Промпт для генерации студийного "
-        "рекламного фото ИМЕННО ЭТОГО товара для обложки маркетплейса. Опиши точно то, "
-        "что на фото: тип, цвет, форму, материал. Формат: commercial product photography, "
-        "studio lighting, clean background, 8k, ultra detailed.\n\n"
+        "Часть 2 (СТРОГО НА АНГЛИЙСКОМ, до 30 слов): Instruction for image editing. "
+        "Формат: 'Place this exact product on a clean studio background with soft lighting, "
+        "preserve the product shape, color and details, professional e-commerce photo, 8k'. "
+        "НЕ описывай сам товар — только инструкцию по стилизации фона и освещения.\n\n"
         f"{user_hint}"
     )
 
@@ -162,7 +163,7 @@ async def analyze_photo_and_make_seo(image_bytes: bytes, caption: str = "") -> t
                         try:
                             full_text = data["candidates"][0]["content"]["parts"][0]["text"]
                         except (KeyError, IndexError) as e:
-                            log.error("Gemini response parse error: %s | data=%s", e, str(data)[:300])
+                            log.error("Gemini parse error: %s | data=%s", e, str(data)[:300])
                             await asyncio.sleep(2)
                             continue
 
@@ -171,43 +172,61 @@ async def analyze_photo_and_make_seo(image_bytes: bytes, caption: str = "") -> t
                         if "===SPLIT===" in full_text:
                             parts = full_text.split("===SPLIT===")
                             return parts[0].strip(), parts[1].strip()
-                        # Если SPLIT не пришёл — вернём всё как SEO + универсальный промпт
                         return full_text.strip(), (
-                            "Commercial product photography, studio lighting, "
-                            "clean background, ultra detailed, 8k"
+                            "Place this exact product on a clean studio background, "
+                            "soft lighting, preserve product details, 8k"
                         )
                     else:
                         err = await resp.text()
-                        log.warning("Gemini vision HTTP %s: %s", resp.status, err[:300])
+                        log.warning("Gemini HTTP %s: %s", resp.status, err[:300])
             except Exception as e:
-                log.warning("Gemini vision attempt %d error: %s", attempt + 1, e)
+                log.warning("Gemini attempt %d error: %s", attempt + 1, e)
             await asyncio.sleep(2)
 
-    # Фоллбэк — если Gemini совсем не отвечает
+    # Фоллбэк
     log.error("Gemini vision failed, fallback to text SEO")
     fallback_item = caption if caption else "товар на фото"
     seo_fallback = await generate_seo(fallback_item)
-    return seo_fallback, "Commercial product photography, studio lighting, 8k"
+    return seo_fallback, "Place this exact product on a clean studio background, soft lighting, 8k"
 
-# --- ГЕНЕРАЦИЯ ОБЛОЖКИ 3:4 (Pollinations) ---
-async def generate_card_image(prompt: str) -> bytes | None:
-    clean_prompt = urllib.parse.quote(prompt[:250])
-    seed = random.randint(1000, 999999)
-    url = (
-        f"https://image.pollinations.ai/prompt/{clean_prompt}"
-        f"?width=768&height=1024&seed={seed}&nologo=true&model=flux"
-    )
+# --- ГЕНЕРАЦИЯ ОБЛОЖКИ через AGNES AI (img2img) ---
+async def generate_card_image(prompt: str, image_bytes: bytes | None = None) -> bytes | None:
+    payload = {
+        "model": "agnes-image-2.0-flash",
+        "prompt": prompt,
+        "size": "768x1024",
+        "extra_body": {
+            "response_format": "b64_json"
+        }
+    }
+
+    if image_bytes:
+        b64_input = base64.b64encode(image_bytes).decode("utf-8")
+        payload["extra_body"]["image"] = [f"data:image/jpeg;base64,{b64_input}"]
 
     async with aiohttp.ClientSession() as s:
-        for _ in range(3):
+        for attempt in range(3):
             try:
-                async with s.get(url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                async with s.post(
+                    AGNES_IMG_URL,
+                    headers={
+                        "Authorization": f"Bearer {AGNES_API_KEY}",
+                        "Content-Type": "application/json"
+                    },
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=90)
+                ) as resp:
                     if resp.status == 200:
-                        data = await resp.read()
-                        if len(data) > 1000:
-                            return data
+                        data = await resp.json()
+                        b64_out = data["data"][0].get("b64_json")
+                        if b64_out:
+                            return base64.b64decode(b64_out)
+                        log.warning("Agnes: no b64_json in response")
+                    else:
+                        err = await resp.text()
+                        log.warning("Agnes HTTP %s: %s", resp.status, err[:300])
             except Exception as e:
-                log.warning("Image gen error: %s", e)
+                log.warning("Agnes attempt %d error: %s", attempt + 1, e)
             await asyncio.sleep(2)
     return None
 
@@ -221,7 +240,7 @@ async def cmd_start(message: types.Message):
         "1️⃣ Отправь мне текстом название товара — я соберу SEO-описание.\n"
         "2️⃣ Отправь мне фотографию товара (лучше с короткой подписью) — "
         "я проанализирую фото через Gemini Vision, сделаю студийную обложку 3:4 "
-        "и напишу полное SEO-описание.\n\n"
+        "с сохранением дизайна товара (Agnes AI) и напишу полное SEO-описание.\n\n"
         "✨ У тебя активен полный безлимит на все генерации.",
         reply_markup=main_keyboard
     )
@@ -242,11 +261,10 @@ async def handle_photo(message: types.Message):
     await get_user(user_id)
 
     wait_msg = await message.answer(
-        "📸 Фото получено! Анализирую через Gemini Vision, пишу SEO и рисую обложку (20–40 сек)..."
+        "📸 Фото получено! Анализирую через Gemini Vision, пишу SEO и стилизую обложку (30–60 сек)..."
     )
 
     try:
-        # Берём крупную версию — Gemini лучше работает с деталями
         photo = message.photo[-1]
         file_info = await bot.get_file(photo.file_id)
         file_stream = io.BytesIO()
@@ -256,8 +274,8 @@ async def handle_photo(message: types.Message):
         caption = message.caption or ""
         seo_text, img_prompt = await analyze_photo_and_make_seo(image_bytes, caption)
 
-        log.info("Generated image prompt: %s", img_prompt)
-        generated_img_bytes = await generate_card_image(img_prompt)
+        log.info("Image prompt: %s", img_prompt)
+        generated_img_bytes = await generate_card_image(img_prompt, image_bytes)
 
         if generated_img_bytes:
             photo_file = BufferedInputFile(generated_img_bytes, filename="wb_ozon_card.jpg")
@@ -287,7 +305,7 @@ async def handle_all_text(message: types.Message):
             f"📊 Статус системы\n\n"
             f"🆔 Ваш ID: {user_id}\n"
             f"✨ Статус: 💎 PRO Безлимит\n"
-            f"🖼 Генерация по фото: Активна (Gemini Vision)\n"
+            f"🖼 Генерация по фото: Активна (Gemini Vision + Agnes AI)\n"
             f"🚀 Все системы работают в штатном режиме.",
             reply_markup=main_keyboard
         )
