@@ -16,11 +16,17 @@ from aiogram.client.session.aiohttp import AiohttpSession
 TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 REPLICATE_API_TOKEN = os.environ.get("REPLICATE_API_TOKEN", "")
 DB_NAME = os.environ.get("DB_NAME", "users.db")
 
-GEMINI_MODELS = ["gemini-3.8-flash", "gemini-flash-latest", "gemini-2.5-flash", "gemini-2.0-flash"]
+# Gemini — цепочка моделей (пробуем по очереди)
+GEMINI_MODELS = ["gemini-3.8-flash", "gemini-flash-latest", "gemini-2.5-flash"]
 GEMINI_URL_TEMPLATE = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
+# Groq — резервный vision
+GROQ_VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+GROQ_VISION_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 # Replicate — FLUX Kontext Pro
 REPLICATE_MODEL = "black-forest-labs/flux-kontext-pro"
@@ -136,7 +142,7 @@ def parse_vision_response(full_text: str) -> tuple[str, str]:
         return parts[0].strip(), parts[1].strip()
     return full_text, "Place this exact product on a clean studio background, soft lighting, preserve the product shape and details, 8k"
 
-# --- VISION через GEMINI ---
+# --- VISION #1: GEMINI ---
 async def analyze_with_gemini(image_bytes: bytes, caption: str = "") -> tuple[str, str] | None:
     b64_image = base64.b64encode(image_bytes).decode("utf-8")
     user_hint = f"\n\nПодсказка от пользователя: {caption}" if caption else ""
@@ -180,25 +186,80 @@ async def analyze_with_gemini(image_bytes: bytes, caption: str = "") -> tuple[st
                 log.warning("Gemini %s error: %s", model, e)
     return None
 
+# --- VISION #2: GROQ (Llama 4 Scout) ---
+async def analyze_with_groq(image_bytes: bytes, caption: str = "") -> tuple[str, str] | None:
+    if not GROQ_API_KEY:
+        log.warning("GROQ_API_KEY not set, skipping")
+        return None
+
+    b64_image = base64.b64encode(image_bytes).decode("utf-8")
+    user_hint = f"\n\nПодсказка: {caption}" if caption else ""
+    full_prompt = VISION_PROMPT + user_hint
+
+    payload = {
+        "model": GROQ_VISION_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": full_prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}}
+                ]
+            }
+        ],
+        "temperature": 0.7,
+        "max_tokens": 3000
+    }
+
+    async with aiohttp.ClientSession() as s:
+        for attempt in range(2):
+            try:
+                async with s.post(
+                    GROQ_VISION_URL,
+                    headers={
+                        "Authorization": f"Bearer {GROQ_API_KEY}",
+                        "Content-Type": "application/json"
+                    },
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=90)
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        text = data["choices"][0]["message"]["content"]
+                        log.info("Groq Vision OK")
+                        return parse_vision_response(text)
+                    else:
+                        err = await resp.text()
+                        log.warning("Groq HTTP %s: %s", resp.status, err[:300])
+            except Exception as e:
+                log.warning("Groq attempt %d error: %s", attempt + 1, e)
+            await asyncio.sleep(2)
+    return None
+
+# --- VISION: цепочка Gemini → Groq ---
 async def analyze_photo_and_make_seo(image_bytes: bytes, caption: str = "") -> tuple[str, str]:
     result = await analyze_with_gemini(image_bytes, caption)
     if result:
         return result
 
-    log.error("Gemini vision failed")
-    return (
-        "⚠️ Не удалось распознать товар на фото — сервис ИИ временно перегружен. "
-        "Попробуйте через 1-2 минуты или добавьте короткую подпись к фото.",
-        "Place this exact product on a clean studio background, soft lighting, preserve the product shape and details, 8k"
-    )
+    log.warning("Gemini failed, trying Groq")
+    result = await analyze_with_groq(image_bytes, caption)
+    if result:
+        return result
 
-# --- ГЕНЕРАЦИЯ ОБЛОЖКИ через REPLICATE FLUX KONTEXT PRO ---
+    log.error("All vision providers failed")
+    fallback_topic = caption if caption else "товар на фото"
+    seo_fallback = await generate_seo(
+        f"{fallback_topic}. Сделай полноценное продающее SEO-описание для маркетплейса Wildberries."
+    )
+    return seo_fallback, "Place this exact product on a clean studio background, soft lighting, preserve the product shape and details, 8k"
+
+# --- ГЕНЕРАЦИЯ ОБЛОЖКИ через REPLICATE FLUX KONTEXT ---
 async def generate_card_image(prompt: str, image_bytes: bytes | None = None) -> bytes | None:
     if not REPLICATE_API_TOKEN:
         log.error("REPLICATE_API_TOKEN not set")
         return None
 
-    # Replicate требует URL или data URI. Передаём base64 data URI.
     input_data = {
         "prompt": prompt,
         "output_format": "jpg",
@@ -213,54 +274,48 @@ async def generate_card_image(prompt: str, image_bytes: bytes | None = None) -> 
     headers = {
         "Authorization": f"Bearer {REPLICATE_API_TOKEN}",
         "Content-Type": "application/json",
-        # Заставляем Replicate ждать готовности до 60 сек (long-poll)
         "Prefer": "wait=60"
     }
 
     async with aiohttp.ClientSession() as s:
-        for attempt in range(2):
-            try:
-                async with s.post(
-                    REPLICATE_URL,
-                    headers=headers,
-                    json={"input": input_data},
-                    timeout=aiohttp.ClientTimeout(total=120)
-                ) as resp:
-                    if resp.status in (200, 201):
-                        data = await resp.json()
-                        status = data.get("status")
-                        output = data.get("output")
+        try:
+            async with s.post(
+                REPLICATE_URL,
+                headers=headers,
+                json={"input": input_data},
+                timeout=aiohttp.ClientTimeout(total=120)
+            ) as resp:
+                if resp.status in (200, 201):
+                    data = await resp.json()
+                    status = data.get("status")
+                    output = data.get("output")
 
-                        # Если ещё processing — поллим вручную
-                        if status in ("starting", "processing"):
-                            poll_url = data.get("urls", {}).get("get")
-                            if poll_url:
-                                output = await _poll_replicate(s, poll_url, headers)
+                    if status in ("starting", "processing"):
+                        poll_url = data.get("urls", {}).get("get")
+                        if poll_url:
+                            output = await _poll_replicate(s, poll_url, headers)
 
-                        # output может быть строкой или списком
-                        img_url = None
-                        if isinstance(output, str):
-                            img_url = output
-                        elif isinstance(output, list) and output:
-                            img_url = output[0]
+                    img_url = None
+                    if isinstance(output, str):
+                        img_url = output
+                    elif isinstance(output, list) and output:
+                        img_url = output[0]
 
-                        if img_url:
-                            async with s.get(img_url, timeout=aiohttp.ClientTimeout(total=60)) as img_resp:
-                                if img_resp.status == 200:
-                                    log.info("Replicate image OK")
-                                    return await img_resp.read()
-                        else:
-                            log.warning("Replicate: no output. data=%s", str(data)[:300])
+                    if img_url:
+                        async with s.get(img_url, timeout=aiohttp.ClientTimeout(total=60)) as r:
+                            if r.status == 200:
+                                log.info("Replicate image OK")
+                                return await r.read()
                     else:
-                        err = await resp.text()
-                        log.warning("Replicate HTTP %s: %s", resp.status, err[:300])
-            except Exception as e:
-                log.warning("Replicate attempt %d error: %s", attempt + 1, e)
-            await asyncio.sleep(3)
+                        log.warning("Replicate: no output. data=%s", str(data)[:300])
+                else:
+                    err = await resp.text()
+                    log.warning("Replicate HTTP %s: %s", resp.status, err[:300])
+        except Exception as e:
+            log.warning("Replicate error: %s", e)
     return None
 
 async def _poll_replicate(s: aiohttp.ClientSession, poll_url: str, headers: dict) -> str | None:
-    """Опрашивает Replicate пока не будет готово (макс 60 сек)."""
     for _ in range(20):
         await asyncio.sleep(3)
         try:
