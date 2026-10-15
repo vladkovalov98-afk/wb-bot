@@ -16,22 +16,15 @@ from aiogram.client.session.aiohttp import AiohttpSession
 TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-CLOUDFLARE_ACCOUNT_ID = os.environ["CLOUDFLARE_ACCOUNT_ID"]
-CLOUDFLARE_API_TOKEN = os.environ["CLOUDFLARE_API_TOKEN"]
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+REPLICATE_API_TOKEN = os.environ.get("REPLICATE_API_TOKEN", "")
 DB_NAME = os.environ.get("DB_NAME", "users.db")
 
-GEMINI_MODELS = ["gemini-flash-latest", "gemini-2.5-flash"]
+GEMINI_MODELS = ["gemini-3.8-flash", "gemini-flash-latest", "gemini-2.5-flash", "gemini-2.0-flash"]
 GEMINI_URL_TEMPLATE = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
-CF_VISION_MODEL = "@cf/meta/llama-3.2-11b-vision-instruct"
-CF_VISION_URL = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/{CF_VISION_MODEL}"
-
-CF_IMG_MODEL = "@cf/black-forest-labs/flux-2-dev"
-CF_IMG_URL = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/{CF_IMG_MODEL}"
-
-GROQ_VISION_MODEL = "qwen/qwen3.6-27b"
-GROQ_VISION_URL = "https://api.groq.com/openai/v1/chat/completions"
+# Replicate — FLUX Kontext Pro
+REPLICATE_MODEL = "black-forest-labs/flux-kontext-pro"
+REPLICATE_URL = f"https://api.replicate.com/v1/models/{REPLICATE_MODEL}/predictions"
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -39,6 +32,7 @@ log = logging.getLogger(__name__)
 bot = Bot(token=TOKEN, session=AiohttpSession())
 dp = Dispatcher()
 
+# --- КЛАВИАТУРА ---
 BTN_GEN = "🚀 Сгенерировать описание"
 BTN_PROFILE = "👤 Мой профиль / Подписка"
 BTN_STATUS = "⚙️ Статус системы"
@@ -66,6 +60,7 @@ VISION_PROMPT = (
     "НЕ описывай сам товар — только инструкцию по стилизации."
 )
 
+# --- БД ---
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("""
@@ -87,6 +82,7 @@ async def get_user(user_id: int):
                 return 999999, 1
             return row[0], row[1]
 
+# --- SEO по тексту (Pollinations) ---
 async def generate_seo(product_text: str) -> str:
     system_prompt = (
         "Ты профессиональный SEO-копирайтер для маркетплейсов Wildberries и Ozon. "
@@ -138,8 +134,9 @@ def parse_vision_response(full_text: str) -> tuple[str, str]:
     if "===SPLIT===" in full_text:
         parts = full_text.split("===SPLIT===")
         return parts[0].strip(), parts[1].strip()
-    return full_text, "Place this exact product on a clean studio background, soft lighting, 8k"
+    return full_text, "Place this exact product on a clean studio background, soft lighting, preserve the product shape and details, 8k"
 
+# --- VISION через GEMINI ---
 async def analyze_with_gemini(image_bytes: bytes, caption: str = "") -> tuple[str, str] | None:
     b64_image = base64.b64encode(image_bytes).decode("utf-8")
     user_hint = f"\n\nПодсказка от пользователя: {caption}" if caption else ""
@@ -183,140 +180,109 @@ async def analyze_with_gemini(image_bytes: bytes, caption: str = "") -> tuple[st
                 log.warning("Gemini %s error: %s", model, e)
     return None
 
-async def analyze_with_groq(image_bytes: bytes, caption: str = "") -> tuple[str, str] | None:
-    if not GROQ_API_KEY:
-        return None
-
-    b64_image = base64.b64encode(image_bytes).decode("utf-8")
-    user_hint = f"\n\nПодсказка: {caption}" if caption else ""
-    full_prompt = VISION_PROMPT + user_hint
-
-    payload = {
-        "model": GROQ_VISION_MODEL,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": full_prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}
-                    }
-                ]
-            }
-        ],
-        "temperature": 0.7,
-        "max_tokens": 3000
-    }
-
-    async with aiohttp.ClientSession() as s:
-        try:
-            async with s.post(
-                GROQ_VISION_URL,
-                headers={
-                    "Authorization": f"Bearer {GROQ_API_KEY}",
-                    "Content-Type": "application/json"
-                },
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=90)
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    text = data["choices"][0]["message"]["content"]
-                    log.info("Groq Vision OK")
-                    return parse_vision_response(text)
-                else:
-                    err = await resp.text()
-                    log.warning("Groq Vision HTTP %s: %s", resp.status, err[:300])
-        except Exception as e:
-            log.warning("Groq Vision error: %s", e)
-    return None
-
-async def analyze_with_cloudflare(image_bytes: bytes, caption: str = "") -> tuple[str, str] | None:
-    b64_image = base64.b64encode(image_bytes).decode("utf-8")
-    user_hint = f"\n\nПодсказка: {caption}" if caption else ""
-    full_prompt = VISION_PROMPT + user_hint
-
-    payload = {
-        "prompt": full_prompt,
-        "image": [b64_image],
-        "max_tokens": 3000
-    }
-
-    async with aiohttp.ClientSession() as s:
-        try:
-            async with s.post(
-                CF_VISION_URL,
-                headers={"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"},
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=90)
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    text = data.get("result", {}).get("response", "")
-                    if text:
-                        log.info("Cloudflare Vision OK")
-                        return parse_vision_response(text)
-                else:
-                    err = await resp.text()
-                    log.warning("Cloudflare Vision HTTP %s: %s", resp.status, err[:300])
-        except Exception as e:
-            log.warning("Cloudflare Vision error: %s", e)
-    return None
-
 async def analyze_photo_and_make_seo(image_bytes: bytes, caption: str = "") -> tuple[str, str]:
-    result = await analyze_with_groq(image_bytes, caption)
-    if result:
-        return result
-
-    log.warning("Groq failed, trying Gemini")
     result = await analyze_with_gemini(image_bytes, caption)
     if result:
         return result
 
-    log.warning("Gemini failed, trying Cloudflare Vision")
-    result = await analyze_with_cloudflare(image_bytes, caption)
-    if result:
-        return result
-
-    log.error("All vision providers failed")
+    log.error("Gemini vision failed")
     return (
-        "⚠️ Не удалось распознать товар на фото — сервисы ИИ временно перегружены. "
-        "Попробуйте ещё раз через 1-2 минуты или добавьте короткую подпись к фото "
-        "(например: «Часы наручные мужские»).",
-        "Place this exact product on a clean studio background, soft lighting, 8k"
+        "⚠️ Не удалось распознать товар на фото — сервис ИИ временно перегружен. "
+        "Попробуйте через 1-2 минуты или добавьте короткую подпись к фото.",
+        "Place this exact product on a clean studio background, soft lighting, preserve the product shape and details, 8k"
     )
 
+# --- ГЕНЕРАЦИЯ ОБЛОЖКИ через REPLICATE FLUX KONTEXT PRO ---
 async def generate_card_image(prompt: str, image_bytes: bytes | None = None) -> bytes | None:
-    headers = {"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"}
-    form = aiohttp.FormData()
-    form.add_field("prompt", prompt)
+    if not REPLICATE_API_TOKEN:
+        log.error("REPLICATE_API_TOKEN not set")
+        return None
+
+    # Replicate требует URL или data URI. Передаём base64 data URI.
+    input_data = {
+        "prompt": prompt,
+        "output_format": "jpg",
+        "aspect_ratio": "3:4",
+        "safety_tolerance": 2
+    }
 
     if image_bytes:
-        form.add_field("input_image_0", image_bytes, filename="input.jpg", content_type="image/jpeg")
+        b64 = base64.b64encode(image_bytes).decode("utf-8")
+        input_data["input_image"] = f"data:image/jpeg;base64,{b64}"
+
+    headers = {
+        "Authorization": f"Bearer {REPLICATE_API_TOKEN}",
+        "Content-Type": "application/json",
+        # Заставляем Replicate ждать готовности до 60 сек (long-poll)
+        "Prefer": "wait=60"
+    }
 
     async with aiohttp.ClientSession() as s:
-        for attempt in range(3):
+        for attempt in range(2):
             try:
                 async with s.post(
-                    CF_IMG_URL,
+                    REPLICATE_URL,
                     headers=headers,
-                    data=form,
+                    json={"input": input_data},
                     timeout=aiohttp.ClientTimeout(total=120)
                 ) as resp:
-                    if resp.status == 200:
+                    if resp.status in (200, 201):
                         data = await resp.json()
-                        img_b64 = data.get("result", {}).get("image")
-                        if img_b64:
-                            return base64.b64decode(img_b64)
+                        status = data.get("status")
+                        output = data.get("output")
+
+                        # Если ещё processing — поллим вручную
+                        if status in ("starting", "processing"):
+                            poll_url = data.get("urls", {}).get("get")
+                            if poll_url:
+                                output = await _poll_replicate(s, poll_url, headers)
+
+                        # output может быть строкой или списком
+                        img_url = None
+                        if isinstance(output, str):
+                            img_url = output
+                        elif isinstance(output, list) and output:
+                            img_url = output[0]
+
+                        if img_url:
+                            async with s.get(img_url, timeout=aiohttp.ClientTimeout(total=60)) as img_resp:
+                                if img_resp.status == 200:
+                                    log.info("Replicate image OK")
+                                    return await img_resp.read()
+                        else:
+                            log.warning("Replicate: no output. data=%s", str(data)[:300])
                     else:
                         err = await resp.text()
-                        log.warning("CF img HTTP %s attempt %d: %s", resp.status, attempt + 1, err[:200])
+                        log.warning("Replicate HTTP %s: %s", resp.status, err[:300])
             except Exception as e:
-                log.warning("CF img attempt %d error: %s", attempt + 1, e)
-            await asyncio.sleep(3 * (attempt + 1))
+                log.warning("Replicate attempt %d error: %s", attempt + 1, e)
+            await asyncio.sleep(3)
     return None
 
+async def _poll_replicate(s: aiohttp.ClientSession, poll_url: str, headers: dict) -> str | None:
+    """Опрашивает Replicate пока не будет готово (макс 60 сек)."""
+    for _ in range(20):
+        await asyncio.sleep(3)
+        try:
+            async with s.get(poll_url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    status = data.get("status")
+                    if status == "succeeded":
+                        out = data.get("output")
+                        if isinstance(out, list) and out:
+                            return out[0]
+                        if isinstance(out, str):
+                            return out
+                        return None
+                    if status in ("failed", "canceled"):
+                        log.warning("Replicate poll: %s — %s", status, data.get("error"))
+                        return None
+        except Exception as e:
+            log.warning("Poll error: %s", e)
+    return None
+
+# --- КОМАНДЫ ---
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await get_user(message.from_user.id)
@@ -339,13 +305,14 @@ async def cmd_admin(message: types.Message):
             (total,) = await cur.fetchone()
     await message.answer(f"📊 Админ-панель\n\nВсего пользователей: {total}")
 
+# --- ФОТО ---
 @dp.message(F.photo)
 async def handle_photo(message: types.Message):
     user_id = message.from_user.id
     await get_user(user_id)
 
     wait_msg = await message.answer(
-        "📸 Фото получено! Анализирую, пишу SEO и стилизую обложку (30–90 сек)..."
+        "📸 Фото получено! Анализирую, пишу SEO и рисую обложку (30–90 сек)..."
     )
 
     try:
@@ -365,18 +332,19 @@ async def handle_photo(message: types.Message):
             photo_file = BufferedInputFile(generated_img_bytes, filename="wb_ozon_card.jpg")
             await message.answer_photo(
                 photo=photo_file,
-                caption="🎨 Готовая студийная обложка для карточки товара (3:4)!"
+                caption="🎨 Готовая студийная обложка для карточки (3:4)!"
             )
             await wait_msg.delete()
             await message.answer(seo_text, reply_markup=main_keyboard)
         else:
             await wait_msg.edit_text(
-                f"⚠️ Сервер графики перегружен, но вот SEO-описание:\n\n{seo_text}"
+                f"⚠️ Не удалось сгенерировать обложку, но вот SEO-описание:\n\n{seo_text}"
             )
     except Exception as e:
         log.exception("handle_photo error")
         await wait_msg.edit_text(f"⚠️ Ошибка при обработке фото: {e}")
 
+# --- ТЕКСТ И КНОПКИ ---
 @dp.message(F.text)
 async def handle_all_text(message: types.Message):
     text = message.text.strip()
@@ -388,7 +356,7 @@ async def handle_all_text(message: types.Message):
             f"📊 Статус системы\n\n"
             f"🆔 ID: {user_id}\n"
             f"✨ Статус: 💎 PRO Безлимит\n"
-            f"🖼 Генерация по фото: Активна\n"
+            f"🖼 Генерация по фото: Активна (FLUX Kontext Pro)\n"
             f"🚀 Все системы в норме.",
             reply_markup=main_keyboard
         )
@@ -427,6 +395,7 @@ async def handle_all_text(message: types.Message):
         for i in range(4000, len(seo_result), 4000):
             await message.answer(seo_result[i:i + 4000])
 
+# --- ЗАПУСК ---
 async def main():
     await init_db()
     await bot.delete_webhook(drop_pending_updates=True)
