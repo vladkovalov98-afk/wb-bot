@@ -16,11 +16,13 @@ from aiogram.client.session.aiohttp import AiohttpSession
 TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-AGNES_API_KEY = os.environ["AGNES_API_KEY"]
+CLOUDFLARE_ACCOUNT_ID = os.environ["CLOUDFLARE_ACCOUNT_ID"]
+CLOUDFLARE_API_TOKEN = os.environ["CLOUDFLARE_API_TOKEN"]
 DB_NAME = os.environ.get("DB_NAME", "users.db")
 
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent"
-AGNES_IMG_URL = "https://apihub.agnes-ai.com/v1/images/generations"
+CF_MODEL = "@cf/black-forest-labs/flux-2-dev"
+CF_API_URL = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/{CF_MODEL}"
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -189,46 +191,46 @@ async def analyze_photo_and_make_seo(image_bytes: bytes, caption: str = "") -> t
     seo_fallback = await generate_seo(fallback_item)
     return seo_fallback, "Place this exact product on a clean studio background, soft lighting, 8k"
 
-# --- ГЕНЕРАЦИЯ ОБЛОЖКИ через AGNES AI (img2img) ---
+# --- ГЕНЕРАЦИЯ ОБЛОЖКИ через CLOUDFLARE WORKERS AI (img2img) ---
 async def generate_card_image(prompt: str, image_bytes: bytes | None = None) -> bytes | None:
-    payload = {
-        "model": "agnes-image-2.0-flash",
-        "prompt": prompt,
-        "size": "768x1024",
-        "extra_body": {
-            "response_format": "b64_json"
-        }
-    }
+    headers = {"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"}
+
+    # Собираем multipart/form-data
+    form = aiohttp.FormData()
+    form.add_field("prompt", prompt)
 
     if image_bytes:
-        b64_input = base64.b64encode(image_bytes).decode("utf-8")
-        payload["extra_body"]["image"] = [f"data:image/jpeg;base64,{b64_input}"]
+        # Cloudflare принимает изображения до 512x512 через multipart
+        form.add_field(
+            "input_image_0",
+            image_bytes,
+            filename="input.jpg",
+            content_type="image/jpeg"
+        )
 
     async with aiohttp.ClientSession() as s:
-        for attempt in range(5):
+        for attempt in range(3):
             try:
                 async with s.post(
-                    AGNES_IMG_URL,
-                    headers={
-                        "Authorization": f"Bearer {AGNES_API_KEY}",
-                        "Content-Type": "application/json"
-                    },
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=90)
+                    CF_API_URL,
+                    headers=headers,
+                    data=form,
+                    timeout=aiohttp.ClientTimeout(total=120)
                 ) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        b64_out = data["data"][0].get("b64_json")
-                        if b64_out:
-                            return base64.b64decode(b64_out)
-                        log.warning("Agnes: no b64_json in response")
+                        # Cloudflare flux-2-dev возвращает JSON с полем result.image (base64)
+                        result = data.get("result", {})
+                        img_b64 = result.get("image")
+                        if img_b64:
+                            return base64.b64decode(img_b64)
+                        log.warning("Cloudflare: no image in response: %s", str(data)[:300])
                     else:
                         err = await resp.text()
-                        log.warning("Agnes HTTP %s attempt %d: %s", resp.status, attempt + 1, err[:300])
+                        log.warning("Cloudflare HTTP %s attempt %d: %s", resp.status, attempt + 1, err[:300])
             except Exception as e:
-                log.warning("Agnes attempt %d error: %s", attempt + 1, e)
-            # Экспоненциальная пауза: 5, 10, 15, 20 секунд
-            await asyncio.sleep(5 * (attempt + 1))
+                log.warning("Cloudflare attempt %d error: %s", attempt + 1, e)
+            await asyncio.sleep(3 * (attempt + 1))
     return None
 
 # --- КОМАНДЫ ---
@@ -241,7 +243,7 @@ async def cmd_start(message: types.Message):
         "1️⃣ Отправь мне текстом название товара — я соберу SEO-описание.\n"
         "2️⃣ Отправь мне фотографию товара (лучше с короткой подписью) — "
         "я проанализирую фото через Gemini Vision, сделаю студийную обложку 3:4 "
-        "с сохранением дизайна товара (Agnes AI) и напишу полное SEO-описание.\n\n"
+        "с сохранением дизайна товара (Cloudflare Workers AI) и напишу полное SEO-описание.\n\n"
         "✨ У тебя активен полный безлимит на все генерации.",
         reply_markup=main_keyboard
     )
@@ -306,7 +308,7 @@ async def handle_all_text(message: types.Message):
             f"📊 Статус системы\n\n"
             f"🆔 Ваш ID: {user_id}\n"
             f"✨ Статус: 💎 PRO Безлимит\n"
-            f"🖼 Генерация по фото: Активна (Gemini Vision + Agnes AI)\n"
+            f"🖼 Генерация по фото: Активна (Gemini Vision + Cloudflare Workers AI)\n"
             f"🚀 Все системы работают в штатном режиме.",
             reply_markup=main_keyboard
         )
