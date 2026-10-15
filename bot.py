@@ -19,7 +19,7 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 AGNES_API_KEY = os.environ["AGNES_API_KEY"]
 DB_NAME = os.environ.get("DB_NAME", "users.db")
 
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent"
 AGNES_IMG_URL = "https://apihub.agnes-ai.com/v1/images/generations"
 
 logging.basicConfig(level=logging.INFO)
@@ -205,7 +205,7 @@ async def generate_card_image(prompt: str, image_bytes: bytes | None = None) -> 
         payload["extra_body"]["image"] = [f"data:image/jpeg;base64,{b64_input}"]
 
     async with aiohttp.ClientSession() as s:
-        for attempt in range(3):
+        for attempt in range(5):
             try:
                 async with s.post(
                     AGNES_IMG_URL,
@@ -224,10 +224,11 @@ async def generate_card_image(prompt: str, image_bytes: bytes | None = None) -> 
                         log.warning("Agnes: no b64_json in response")
                     else:
                         err = await resp.text()
-                        log.warning("Agnes HTTP %s: %s", resp.status, err[:300])
+                        log.warning("Agnes HTTP %s attempt %d: %s", resp.status, attempt + 1, err[:300])
             except Exception as e:
                 log.warning("Agnes attempt %d error: %s", attempt + 1, e)
-            await asyncio.sleep(2)
+            # Экспоненциальная пауза: 5, 10, 15, 20 секунд
+            await asyncio.sleep(5 * (attempt + 1))
     return None
 
 # --- КОМАНДЫ ---
@@ -261,7 +262,7 @@ async def handle_photo(message: types.Message):
     await get_user(user_id)
 
     wait_msg = await message.answer(
-        "📸 Фото получено! Анализирую через Gemini Vision, пишу SEO и стилизую обложку (30–60 сек)..."
+        "📸 Фото получено! Анализирую через Gemini Vision, пишу SEO и стилизую обложку (30–90 сек)..."
     )
 
     try:
