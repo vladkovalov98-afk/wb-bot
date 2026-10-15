@@ -20,7 +20,15 @@ CLOUDFLARE_ACCOUNT_ID = os.environ["CLOUDFLARE_ACCOUNT_ID"]
 CLOUDFLARE_API_TOKEN = os.environ["CLOUDFLARE_API_TOKEN"]
 DB_NAME = os.environ.get("DB_NAME", "users.db")
 
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent"
+# Цепочка моделей Gemini: сначала быстрая, потом стабильная, потом резерв
+GEMINI_MODELS = [
+    "gemini-3.8-flash",
+    "gemini-flash-latest",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+]
+GEMINI_URL_TEMPLATE = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
 CF_MODEL = "@cf/black-forest-labs/flux-2-dev"
 CF_API_URL = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/{CF_MODEL}"
 
@@ -152,55 +160,70 @@ async def analyze_photo_and_make_seo(image_bytes: bytes, caption: str = "") -> t
     }
 
     async with aiohttp.ClientSession() as s:
-        for attempt in range(3):
-            try:
-                async with s.post(
-                    GEMINI_URL,
-                    headers={"x-goog-api-key": GEMINI_API_KEY},
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=60)
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        try:
-                            full_text = data["candidates"][0]["content"]["parts"][0]["text"]
-                        except (KeyError, IndexError) as e:
-                            log.error("Gemini parse error: %s | data=%s", e, str(data)[:300])
-                            await asyncio.sleep(2)
-                            continue
+        # Перебираем модели одну за другой
+        for model in GEMINI_MODELS:
+            url = GEMINI_URL_TEMPLATE.format(model=model)
+            for attempt in range(3):
+                try:
+                    async with s.post(
+                        url,
+                        headers={"x-goog-api-key": GEMINI_API_KEY},
+                        json=payload,
+                        timeout=aiohttp.ClientTimeout(total=60)
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            try:
+                                full_text = data["candidates"][0]["content"]["parts"][0]["text"]
+                            except (KeyError, IndexError) as e:
+                                log.error("Gemini parse error: %s | data=%s", e, str(data)[:300])
+                                await asyncio.sleep(2)
+                                continue
 
-                        full_text = full_text.replace("**", "").replace("##", "").replace("###", "")
+                            full_text = full_text.replace("**", "").replace("##", "").replace("###", "")
+                            log.info("Gemini OK with model %s", model)
 
-                        if "===SPLIT===" in full_text:
-                            parts = full_text.split("===SPLIT===")
-                            return parts[0].strip(), parts[1].strip()
-                        return full_text.strip(), (
-                            "Place this exact product on a clean studio background, "
-                            "soft lighting, preserve product details, 8k"
-                        )
-                    else:
-                        err = await resp.text()
-                        log.warning("Gemini HTTP %s: %s", resp.status, err[:300])
-            except Exception as e:
-                log.warning("Gemini attempt %d error: %s", attempt + 1, e)
-            await asyncio.sleep(2)
+                            if "===SPLIT===" in full_text:
+                                parts = full_text.split("===SPLIT===")
+                                return parts[0].strip(), parts[1].strip()
+                            return full_text.strip(), (
+                                "Place this exact product on a clean studio background, "
+                                "soft lighting, preserve product details, 8k"
+                            )
+                        elif resp.status in (503, 429):
+                            # Модель перегружена — переходим к следующей модели
+                            err = await resp.text()
+                            log.warning("Gemini %s -> %s (switching model): %s", model, resp.status, err[:150])
+                            break
+                        elif resp.status == 404:
+                            # Модель не существует — переходим к следующей
+                            log.warning("Gemini model %s not found (404), trying next", model)
+                            break
+                        else:
+                            err = await resp.text()
+                            log.warning("Gemini %s HTTP %s: %s", model, resp.status, err[:300])
+                except Exception as e:
+                    log.warning("Gemini %s attempt %d error: %s", model, attempt + 1, e)
+                await asyncio.sleep(2)
+            # Небольшая пауза перед следующей моделью
+            await asyncio.sleep(1)
 
-    # Фоллбэк
-    log.error("Gemini vision failed, fallback to text SEO")
-    fallback_item = caption if caption else "товар на фото"
-    seo_fallback = await generate_seo(fallback_item)
+    # Все модели упали — фоллбэк
+    log.error("All Gemini models failed, fallback to Pollinations")
+    fallback_topic = caption if caption else "кроссовки спортивные мужские"
+    seo_fallback = await generate_seo(
+        f"{fallback_topic}. Сделай полноценное продающее SEO-описание для маркетплейса Wildberries."
+    )
     return seo_fallback, "Place this exact product on a clean studio background, soft lighting, 8k"
 
 # --- ГЕНЕРАЦИЯ ОБЛОЖКИ через CLOUDFLARE WORKERS AI (img2img) ---
 async def generate_card_image(prompt: str, image_bytes: bytes | None = None) -> bytes | None:
     headers = {"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"}
 
-    # Собираем multipart/form-data
     form = aiohttp.FormData()
     form.add_field("prompt", prompt)
 
     if image_bytes:
-        # Cloudflare принимает изображения до 512x512 через multipart
         form.add_field(
             "input_image_0",
             image_bytes,
@@ -219,7 +242,6 @@ async def generate_card_image(prompt: str, image_bytes: bytes | None = None) -> 
                 ) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        # Cloudflare flux-2-dev возвращает JSON с полем result.image (base64)
                         result = data.get("result", {})
                         img_b64 = result.get("image")
                         if img_b64:
@@ -242,8 +264,8 @@ async def cmd_start(message: types.Message):
         "📌 Что я умею:\n"
         "1️⃣ Отправь мне текстом название товара — я соберу SEO-описание.\n"
         "2️⃣ Отправь мне фотографию товара (лучше с короткой подписью) — "
-        "я проанализирую фото через Gemini Vision, сделаю студийную обложку 3:4 "
-        "с сохранением дизайна товара (Cloudflare Workers AI) и напишу полное SEO-описание.\n\n"
+        "я проанализирую фото, сделаю студийную обложку 3:4 "
+        "с сохранением дизайна товара и напишу полное SEO-описание.\n\n"
         "✨ У тебя активен полный безлимит на все генерации.",
         reply_markup=main_keyboard
     )
@@ -264,7 +286,7 @@ async def handle_photo(message: types.Message):
     await get_user(user_id)
 
     wait_msg = await message.answer(
-        "📸 Фото получено! Анализирую через Gemini Vision, пишу SEO и стилизую обложку (30–90 сек)..."
+        "📸 Фото получено! Анализирую, пишу SEO и стилизую обложку (30–90 сек)..."
     )
 
     try:
