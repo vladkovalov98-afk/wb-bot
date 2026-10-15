@@ -154,7 +154,7 @@ async def analyze_photo_and_make_seo(image_bytes: bytes, caption: str = "") -> t
             try:
                 async with s.post(
                     GEMINI_URL,
-                    params={"key": GEMINI_API_KEY},
+                    headers={"x-goog-api-key": GEMINI_API_KEY},
                     json=payload,
                     timeout=aiohttp.ClientTimeout(total=60)
                 ) as resp:
