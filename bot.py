@@ -14,9 +14,12 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, BufferedInputFile
 from aiogram.client.session.aiohttp import AiohttpSession
 
 # --- НАСТРОЙКИ ---
-TOKEN = os.environ["BOT_TOKEN"]                    # добавить в Railway → Variables
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))    # добавить в Railway → Variables
+TOKEN = os.environ["BOT_TOKEN"]
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 DB_NAME = os.environ.get("DB_NAME", "users.db")
+
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -59,7 +62,7 @@ async def get_user(user_id: int):
                 return 999999, 1
             return row[0], row[1]
 
-# --- SEO ПО ТЕКСТУ ---
+# --- SEO ПО ТЕКСТУ (Pollinations) ---
 async def generate_seo(product_text: str) -> str:
     system_prompt = (
         "Ты профессиональный SEO-копирайтер для маркетплейсов Wildberries и Ozon. "
@@ -96,7 +99,6 @@ async def generate_seo(product_text: str) -> str:
                 log.warning("SEO attempt %d error: %s", attempt + 1, e)
             await asyncio.sleep(1.5)
 
-        # Резервный GET
         try:
             short = (
                 f"Напиши продающее SEO-описание для Wildberries и Ozon "
@@ -112,65 +114,82 @@ async def generate_seo(product_text: str) -> str:
 
     return "⚠️ Сервер ИИ временно перегружен. Попробуй ещё раз через 10 секунд."
 
-# --- VISION: ФОТО → SEO + ПРОМПТ ДЛЯ ОБЛОЖКИ ---
+# --- VISION через GEMINI: ФОТО → SEO + ПРОМПТ ДЛЯ ОБЛОЖКИ ---
 async def analyze_photo_and_make_seo(image_bytes: bytes, caption: str = "") -> tuple[str, str]:
     b64_image = base64.b64encode(image_bytes).decode("utf-8")
-    user_hint = f"Товар на фото: {caption}" if caption else "Определи товар на фото самостоятельно."
+    user_hint = f"Товар на фото: {caption}." if caption else ""
 
-    system_prompt = (
-        "Ты эксперт по маркетплейсам Wildberries и Ozon. Посмотри на фото товара и выдай ответ строго из двух частей, разделённых меткой ===SPLIT===:\n"
-        "Часть 1 (на русском): Продающее SEO-описание карточки (Заголовок, Описание, 5 преимуществ, Ключевые слова). Без символов ** и ##.\n"
-        "===SPLIT===\n"
-        "Часть 2 (НА АНГЛИЙСКОМ, до 30 слов): Промпт для генерации студийного рекламного фото этого товара "
-        "(commercial product photography, studio lighting, clean luxury background, 8k)."
+    prompt = (
+        "Ты эксперт по маркетплейсам Wildberries и Ozon. "
+        "Посмотри ВНИМАТЕЛЬНО на фото и определи, что за товар на нём изображён "
+        "(тип товара, цвет, материал, ключевые детали). Отвечай СТРОГО в двух частях, "
+        "разделённых меткой ===SPLIT===:\n\n"
+        "Часть 1 (на русском): Продающее SEO-описание карточки для ЭТОГО товара "
+        "(Заголовок до 60 символов, Описание 800-1200 символов, 5 преимуществ буллитами, "
+        "10-15 ключевых запросов через запятую). Без символов ** и ##.\n\n"
+        "===SPLIT===\n\n"
+        "Часть 2 (СТРОГО НА АНГЛИЙСКОМ, до 30 слов): Промпт для генерации студийного "
+        "рекламного фото ИМЕННО ЭТОГО товара для обложки маркетплейса. Опиши точно то, "
+        "что на фото: тип, цвет, форму, материал. Формат: commercial product photography, "
+        "studio lighting, clean background, 8k, ultra detailed.\n\n"
+        f"{user_hint}"
     )
 
     payload = {
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": user_hint},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}}
-                ]
-            }
-        ],
-        "model": "openai"
+        "contents": [{
+            "parts": [
+                {"text": prompt},
+                {"inline_data": {"mime_type": "image/jpeg", "data": b64_image}}
+            ]
+        }],
+        "generationConfig": {
+            "temperature": 0.7,
+            "maxOutputTokens": 3000
+        }
     }
 
     async with aiohttp.ClientSession() as s:
         for attempt in range(3):
             try:
                 async with s.post(
-                    "https://text.pollinations.ai/",
+                    GEMINI_URL,
+                    params={"key": GEMINI_API_KEY},
                     json=payload,
-                    timeout=aiohttp.ClientTimeout(total=50)
+                    timeout=aiohttp.ClientTimeout(total=60)
                 ) as resp:
                     if resp.status == 200:
-                        full_text = (await resp.text()).replace("**", "").replace("##", "").replace("###", "")
+                        data = await resp.json()
+                        try:
+                            full_text = data["candidates"][0]["content"]["parts"][0]["text"]
+                        except (KeyError, IndexError) as e:
+                            log.error("Gemini response parse error: %s | data=%s", e, str(data)[:300])
+                            await asyncio.sleep(2)
+                            continue
+
+                        full_text = full_text.replace("**", "").replace("##", "").replace("###", "")
+
                         if "===SPLIT===" in full_text:
                             parts = full_text.split("===SPLIT===")
                             return parts[0].strip(), parts[1].strip()
+                        # Если SPLIT не пришёл — вернём всё как SEO + универсальный промпт
                         return full_text.strip(), (
-                            f"Professional commercial product photography of "
-                            f"{caption or 'modern product'}, studio lighting, luxury background, 8k"
+                            "Commercial product photography, studio lighting, "
+                            "clean background, ultra detailed, 8k"
                         )
-                    log.warning("Vision HTTP %s", resp.status)
+                    else:
+                        err = await resp.text()
+                        log.warning("Gemini vision HTTP %s: %s", resp.status, err[:300])
             except Exception as e:
-                log.warning("Vision attempt %d error: %s", attempt + 1, e)
+                log.warning("Gemini vision attempt %d error: %s", attempt + 1, e)
             await asyncio.sleep(2)
 
-    # Фоллбэк: хотя бы SEO по подписи + универсальный промпт
-    fallback_item = caption if caption else "Тактические кроссовки / обувь"
+    # Фоллбэк — если Gemini совсем не отвечает
+    log.error("Gemini vision failed, fallback to text SEO")
+    fallback_item = caption if caption else "товар на фото"
     seo_fallback = await generate_seo(fallback_item)
-    prompt_fallback = (
-        f"Commercial product photography of {caption or 'modern product'}, "
-        f"studio lighting, podium background, ultra detailed, 8k"
-    )
-    return seo_fallback, prompt_fallback
+    return seo_fallback, "Commercial product photography, studio lighting, 8k"
 
-# --- ГЕНЕРАЦИЯ ОБЛОЖКИ 3:4 ---
+# --- ГЕНЕРАЦИЯ ОБЛОЖКИ 3:4 (Pollinations) ---
 async def generate_card_image(prompt: str) -> bytes | None:
     clean_prompt = urllib.parse.quote(prompt[:250])
     seed = random.randint(1000, 999999)
@@ -200,8 +219,9 @@ async def cmd_start(message: types.Message):
         "👋 Привет! Я ИИ-помощник для селлеров Wildberries и Ozon.\n\n"
         "📌 Что я умею:\n"
         "1️⃣ Отправь мне текстом название товара — я соберу SEO-описание.\n"
-        "2️⃣ Отправь мне фотографию товара (лучше с короткой подписью, например: «Кроссовки мужские хаки») — "
-        "я сделаю готовую студийную обложку 3:4 для карточки и напишу полное SEO-описание!\n\n"
+        "2️⃣ Отправь мне фотографию товара (лучше с короткой подписью) — "
+        "я проанализирую фото через Gemini Vision, сделаю студийную обложку 3:4 "
+        "и напишу полное SEO-описание.\n\n"
         "✨ У тебя активен полный безлимит на все генерации.",
         reply_markup=main_keyboard
     )
@@ -222,11 +242,12 @@ async def handle_photo(message: types.Message):
     await get_user(user_id)
 
     wait_msg = await message.answer(
-        "📸 Фото получено! Анализирую товар, пишу SEO-описание и создаю обложку для карточки (20–35 сек)..."
+        "📸 Фото получено! Анализирую через Gemini Vision, пишу SEO и рисую обложку (20–40 сек)..."
     )
 
     try:
-        photo = message.photo[1] if len(message.photo) > 1 else message.photo[0]
+        # Берём крупную версию — Gemini лучше работает с деталями
+        photo = message.photo[-1]
         file_info = await bot.get_file(photo.file_id)
         file_stream = io.BytesIO()
         await bot.download_file(file_info.file_path, destination=file_stream)
@@ -235,6 +256,7 @@ async def handle_photo(message: types.Message):
         caption = message.caption or ""
         seo_text, img_prompt = await analyze_photo_and_make_seo(image_bytes, caption)
 
+        log.info("Generated image prompt: %s", img_prompt)
         generated_img_bytes = await generate_card_image(img_prompt)
 
         if generated_img_bytes:
@@ -265,7 +287,7 @@ async def handle_all_text(message: types.Message):
             f"📊 Статус системы\n\n"
             f"🆔 Ваш ID: {user_id}\n"
             f"✨ Статус: 💎 PRO Безлимит\n"
-            f"🖼 Генерация по фото: Активна\n"
+            f"🖼 Генерация по фото: Активна (Gemini Vision)\n"
             f"🚀 Все системы работают в штатном режиме.",
             reply_markup=main_keyboard
         )
